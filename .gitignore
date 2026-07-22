@@ -1,0 +1,55 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test, coverage, and type-checker outputs
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.pyre/
+.pytype/
+coverage.xml
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs and local runtime files
+*.log
+*.pid
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+.python-version
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Private local notes
+README.local.md
+TODO.local.md
+notes/local-*.md

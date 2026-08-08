@@ -239,6 +239,13 @@ def parse_pnc_description_and_type(raw_description: object) -> Tuple[str, str]:
     upper_description = description.upper()
     debit_marker = " DEBIT CARD PURCHASE"
     pos_marker = " POS PURCHASE"
+    recurring_marker = " RECURRING DEBIT CARD"
+
+    if recurring_marker in upper_description:
+        marker_idx = upper_description.index(recurring_marker)
+        merchant = description[:marker_idx].strip()
+        merchant = re.sub(r"\s+x{2,}\d{2,4}$", "", merchant, flags=re.IGNORECASE).strip()
+        return merchant, "RECURRING DEBIT CARD"
 
     if debit_marker in upper_description:
         marker_idx = upper_description.index(debit_marker)

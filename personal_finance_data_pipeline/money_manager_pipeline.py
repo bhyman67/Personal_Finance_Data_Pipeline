@@ -44,6 +44,7 @@ REQUIRED_SOURCES: Sequence[str] = [
     "FirstBank - Gold Visa - Transactions.csv",
     "PNC - accountActivityExport - Spending.csv",
     "PNC - accountActivityExport - Savings.csv",
+    "PNC - Cash Rewards Visa - Transactions.csv",
     "Upwork - Transactions.csv",
     "Robinhood - Spending Settled - Transactions.csv",
     "Robinhood - Unified Transfers - Transactions.csv",
@@ -93,6 +94,7 @@ PATH_REGISTRY_SOURCE_MAP: Dict[str, str] = {
     "FirstBank Gold Visa Transactions": "FirstBank - Gold Visa - Transactions.csv",
     "PNC Spending Transactions": "PNC - accountActivityExport - Spending.csv",
     "PNC Savings Transactions": "PNC - accountActivityExport - Savings.csv",
+    "PNC Cash Rewards Visa": "PNC - Cash Rewards Visa - Transactions.csv",
     "Upwork Transactions": "Upwork - Transactions.csv",
     "Robinhood Spending Settled Transactions": "Robinhood - Spending Settled - Transactions.csv",
     "Robinhood Unified Transfers Transactions": "Robinhood - Unified Transfers - Transactions.csv",
@@ -945,6 +947,99 @@ def load_pnc(path: Path) -> pd.DataFrame:
     return to_standard_frame(out)
 
 
+def parse_credit_debit_indicator(value: object) -> str:
+    text = normalize_text(value).upper()
+    if not text:
+        return ""
+
+    if "DEBIT" in text or text in {"D", "DR"}:
+        return "Debit"
+    if "CREDIT" in text or text in {"C", "CR"}:
+        return "Credit"
+    return ""
+
+
+def infer_positive_is_expense(amounts: pd.Series) -> bool:
+    positives = int((amounts > 0).sum())
+    negatives = int((amounts < 0).sum())
+    return positives >= negatives
+
+
+def load_pnc_cash_rewards_visa(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if df.empty:
+        return to_standard_frame(pd.DataFrame(columns=OUTPUT_COLUMNS))
+
+    post_col = select_column_by_keyword_groups(
+        df.columns,
+        (("post", "date"), ("posting", "date"), ("transaction", "date"), ("date",)),
+    ) or df.columns[0]
+    txn_col = select_column_by_keyword_groups(
+        df.columns,
+        (("transaction", "date"), ("purchase", "date"), ("date",)),
+    ) or post_col
+    amount_col = select_column_by_keyword_groups(df.columns, (("amount",),))
+    description_col = select_column_by_keyword_groups(
+        df.columns,
+        (("description",), ("merchant",), ("payee",), ("memo",)),
+    ) or (df.columns[2] if len(df.columns) > 2 else df.columns[0])
+    type_col = select_column_by_keyword_groups(df.columns, (("type",), ("category",)))
+    credit_debit_col = select_column_by_keyword_groups(
+        df.columns,
+        (("credit", "debit"), ("debit", "credit"), ("debit", "credit", "indicator"), ("direction",)),
+    )
+
+    if amount_col is None:
+        raise ValueError(f"Unable to identify amount column for source: {path.name}")
+
+    df["PostDate"] = df[post_col].apply(parse_date)
+    df["TxnDate"] = df[txn_col].apply(parse_date)
+    df["AmountSigned"] = df[amount_col].apply(parse_money)
+    df["DescriptionClean"] = df[description_col].apply(normalize_text)
+
+    df = df[df["PostDate"].notna() & df["AmountSigned"].notna()].copy()
+
+    post_text = df[post_col].astype(str).str.upper()
+    df = df[~post_text.str.startswith("PENDING")].copy()
+
+    if credit_debit_col:
+        df["Credit_Debit_Ind"] = df[credit_debit_col].apply(parse_credit_debit_indicator)
+        missing_cd = df["Credit_Debit_Ind"].str.len() == 0
+        df.loc[missing_cd, "Credit_Debit_Ind"] = df.loc[missing_cd, "AmountSigned"].apply(assign_credit_debit_ind)
+        positive_is_expense = True
+    else:
+        positive_is_expense = infer_positive_is_expense(df["AmountSigned"])
+        df["Credit_Debit_Ind"] = df["AmountSigned"].apply(assign_credit_debit_ind)
+
+    if positive_is_expense:
+        df["Income or Expense"] = df["Credit_Debit_Ind"].apply(
+            lambda x: "Expense" if x == "Credit" else "Income"
+        )
+    else:
+        df["Income or Expense"] = df["Credit_Debit_Ind"].apply(
+            lambda x: "Income" if x == "Credit" else "Expense"
+        )
+
+    missing_txn = df["TxnDate"].isna()
+    df.loc[missing_txn, "TxnDate"] = df.loc[missing_txn, "PostDate"]
+
+    out = pd.DataFrame(
+        {
+            "Post Date": df["PostDate"].apply(format_mmddyyyy),
+            "Transaction Date": df["TxnDate"].apply(format_mmddyyyy),
+            "Account": "PNC Cash Rewards Visa",
+            "Amount": df["AmountSigned"].abs(),
+            "Description": df["DescriptionClean"],
+            "Type": df[type_col].apply(normalize_text) if type_col else "CREDIT CARD",
+            "Income or Expense": df["Income or Expense"],
+            "Description Category": "",
+        }
+    )
+
+    out = out[out["Description"].str.len() > 0].copy()
+    return to_standard_frame(out)
+
+
 def load_rh_spending_settled(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     date_col = "post_date" if "post_date" in df.columns else "initiated_at"
@@ -1183,6 +1278,7 @@ def build_all_transactions(source_paths: Dict[str, Path]) -> pd.DataFrame:
     frames.append(load_firstbank(source_paths["FirstBank - Gold Visa - Transactions.csv"]))
     frames.append(load_pnc(source_paths["PNC - accountActivityExport - Spending.csv"]))
     frames.append(load_pnc(source_paths["PNC - accountActivityExport - Savings.csv"]))
+    frames.append(load_pnc_cash_rewards_visa(source_paths["PNC - Cash Rewards Visa - Transactions.csv"]))
     frames.append(load_upwork(source_paths["Upwork - Transactions.csv"]))
 
     frames.append(load_rh_spending_settled(source_paths["Robinhood - Spending Settled - Transactions.csv"]))

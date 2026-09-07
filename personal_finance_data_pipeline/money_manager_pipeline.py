@@ -1082,7 +1082,9 @@ def load_rh_historical_activities(path: Path) -> pd.DataFrame:
             "Transaction Date": df["PostDate"].apply(format_mmddyyyy),
             "Account": "Robinhood Cash Card",
             "Amount": df["AmountNum"].abs(),
-            "Description": df["metadata.title"].fillna("CASH BACK").astype(str),
+            "Description": df["metadata.title"].fillna("CASH BACK").astype(str).apply(
+                lambda value: re.sub(r"\s*\([^)]*\)", "", value).strip()
+            ),
             "Type": "CASH BACK",
             "Income or Expense": "Income",
             "Description Category": "",

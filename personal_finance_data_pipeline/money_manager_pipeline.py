@@ -800,18 +800,48 @@ def apply_original_rules(
     manual_categories: pd.DataFrame,
     transaction_excludes: pd.DataFrame,
 ) -> pd.DataFrame:
-    df = to_standard_frame(all_txns).copy()
+    filtered, _ = apply_original_rules_with_exclusions(
+        all_txns,
+        description_lookup,
+        description_excludes,
+        manual_categories,
+        transaction_excludes,
+    )
+    return filtered
+
+
+def apply_original_rules_with_exclusions(
+    all_txns: pd.DataFrame,
+    description_lookup: Dict[str, str],
+    description_excludes: List[str],
+    manual_categories: pd.DataFrame,
+    transaction_excludes: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = to_standard_frame(all_txns).reset_index(drop=True)
 
     df["Description"] = df["Description"].apply(normalize_text)
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
     df = df[df["Amount"].notna()].copy()
     df["Amount Match"] = df["Amount"].apply(normalize_amount)
+    excluded_frames: List[pd.DataFrame] = []
 
     # Equivalent to Income_Expense_Exclude filtering by description substring.
     if description_excludes:
-        pattern = "|".join(re.escape(item) for item in description_excludes if item)
-        if pattern:
-            df = df[~df["Description"].str.contains(pattern, case=False, regex=True, na=False)].copy()
+        excludes = [item for item in description_excludes if item]
+        if excludes:
+            matched_excludes = df["Description"].apply(
+                lambda description: [
+                    item for item in excludes if item.casefold() in description.casefold()
+                ]
+            )
+            exclude_mask = matched_excludes.str.len() > 0
+            if exclude_mask.any():
+                removed = df.loc[exclude_mask].copy()
+                removed["Exclusion Reason"] = matched_excludes.loc[exclude_mask].apply(
+                    lambda items: "Description exclude: " + "; ".join(items)
+                )
+                excluded_frames.append(removed)
+                df = df.loc[~exclude_mask].copy()
 
     # Auto-categorize by substring lookup.
     if description_lookup:
@@ -832,6 +862,8 @@ def apply_original_rules(
 
     # Transaction-level exclusion rules.
     if not transaction_excludes.empty:
+        exclude_mask = pd.Series(False, index=df.index)
+        exclusion_reasons = pd.Series("", index=df.index, dtype="object")
         for _, row in transaction_excludes.iterrows():
             mask = (
                 (df["Post Date"] == row["Date"])
@@ -839,11 +871,27 @@ def apply_original_rules(
                 & (df["Description"] == row["Description"])
                 & (df["Income or Expense"] == row["Income or Expense"])
             )
-            if mask.any():
-                df = df[~mask].copy()
+            new_matches = mask & ~exclude_mask
+            if new_matches.any():
+                exclusion_reasons.loc[new_matches] = (
+                    "Transaction exclude rule: "
+                    f'{row["Date"]} | {row["Amount"]} | {row["Description"]} | '
+                    f'{row["Income or Expense"]}'
+                )
+                exclude_mask |= mask
+        if exclude_mask.any():
+            removed = df.loc[exclude_mask].copy()
+            removed["Exclusion Reason"] = exclusion_reasons.loc[exclude_mask]
+            excluded_frames.append(removed)
+            df = df.loc[~exclude_mask].copy()
 
     df = df.drop(columns=["Amount Match"])
-    return to_standard_frame(df)
+    excluded = (
+        pd.concat(excluded_frames, ignore_index=True)
+        if excluded_frames
+        else pd.DataFrame(columns=OUTPUT_COLUMNS + ["Exclusion Reason"])
+    )
+    return to_standard_frame(df), excluded[OUTPUT_COLUMNS + ["Exclusion Reason"]]
 
 
 def load_firstbank(path: Path) -> pd.DataFrame:
@@ -1359,6 +1407,12 @@ def parse_args() -> argparse.Namespace:
         help="Output CSV path (default: ./All Transactions.csv)",
     )
     parser.add_argument(
+        "--excluded-output",
+        type=str,
+        default="",
+        help="Path for excluded transactions (default: alongside output as '<output name> - Excluded.csv').",
+    )
+    parser.add_argument(
         "--description-lookup",
         type=str,
         default="",
@@ -1395,6 +1449,11 @@ def main(workbook: Optional[Any] = None) -> None:
     args = parse_args()
     search_root = resolve_search_root(args.search_root, workbook)
     output_path = Path(args.output)
+    excluded_output_path = (
+        Path(args.excluded_output)
+        if args.excluded_output
+        else output_path.with_name(f"{output_path.stem} - Excluded{output_path.suffix or '.csv'}")
+    )
 
     if not search_root.exists():
         raise FileNotFoundError(f"Search root does not exist: {search_root}")
@@ -1436,7 +1495,7 @@ def main(workbook: Optional[Any] = None) -> None:
     transaction_excludes = load_transaction_excludes(txn_excludes_path)
     event_replacements = load_event_replacements(event_replacements_path)
 
-    all_txns = apply_original_rules(
+    all_txns, excluded_txns = apply_original_rules_with_exclusions(
         all_txns,
         description_lookup,
         description_excludes,
@@ -1448,12 +1507,28 @@ def main(workbook: Optional[Any] = None) -> None:
         all_txns = pd.concat([all_txns, event_replacements], ignore_index=True)
 
     all_txns["Post Date Sort"] = pd.to_datetime(all_txns["Post Date"], errors="coerce")
-    all_txns = all_txns[all_txns["Post Date Sort"] >= MIN_POST_DATE].copy()
+    included_by_date = all_txns["Post Date Sort"] >= MIN_POST_DATE
+    date_excluded = all_txns.loc[~included_by_date].copy()
+    date_excluded["Exclusion Reason"] = date_excluded["Post Date Sort"].apply(
+        lambda post_date: (
+            f"Post Date before {MIN_POST_DATE.strftime('%Y-%m-%d')}"
+            if pd.notna(post_date)
+            else "Post Date could not be parsed"
+        )
+    )
+    if not date_excluded.empty:
+        excluded_txns = pd.concat(
+            [excluded_txns, date_excluded[OUTPUT_COLUMNS + ["Exclusion Reason"]]],
+            ignore_index=True,
+        )
+    all_txns = all_txns.loc[included_by_date].copy()
     all_txns = all_txns.sort_values(by="Post Date Sort", ascending=False).drop(columns=["Post Date Sort"])
 
     all_txns.to_csv(output_path, index=False)
+    excluded_txns.to_csv(excluded_output_path, index=False)
 
     print(f"Wrote {len(all_txns):,} rows to {output_path.resolve()}")
+    print(f"Wrote {len(excluded_txns):,} excluded rows to {excluded_output_path.resolve()}")
     print(f"Description lookup rows applied: {len(description_lookup):,}")
     print(f"Description excludes loaded: {len(description_excludes):,}")
     print(f"Manual category rules loaded: {len(manual_categories):,}")

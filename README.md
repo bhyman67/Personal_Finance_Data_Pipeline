@@ -8,6 +8,7 @@ Personal transaction normalization pipeline for consolidating exports from multi
 - Normalizes key fields such as dates, amounts, account names, and transaction type.
 - Applies optional rule tables for categorization, exclusions, and manual overrides.
 - Produces an `All Transactions.csv` output with a stable column layout.
+- Writes rule-excluded and pre-2022 transactions to a companion `All Transactions - Excluded.csv` file with an exclusion reason.
 
 Designed for repeatable monthly or ad hoc transaction consolidation.
 
@@ -28,6 +29,8 @@ Path resolution order is explicit source-path mappings first (when provided by w
 If required source files are still missing after resolution, the run fails with a clear missing-files error.
 
 This keeps workbook automation flexible while preserving the same normalization logic used by CLI runs.
+
+The excluded-transactions file is written next to the main output by default. For command-line runs, use `--excluded-output` to choose a different path. It records transactions excluded by the description-exclude rules, transaction-exclude rules, and minimum post-date filter; rows discarded inside source-specific parsing (for example, invalid dates or amounts) are not included.
 
 ## Output Schema
 

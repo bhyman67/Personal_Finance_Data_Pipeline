@@ -4,16 +4,16 @@ $venvPath = Join-Path $PSScriptRoot '.venv'
 $python = Join-Path $venvPath 'Scripts\python.exe'
 
 if (-not (Test-Path -LiteralPath $venvPath)) {
-    if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
-        throw 'Python launcher not found. Install Python 3.10 or newer and the Windows Python launcher.'
+    if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+        throw 'Python not found. Make sure Python 3.10 or newer is installed and added to PATH.'
     }
 
-    & py -3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
+    & python -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
     if ($LASTEXITCODE -ne 0) {
-        throw 'The Python launcher must select Python 3.10 or newer.'
+        throw 'Python must be version 3.10 or newer.'
     }
 
-    & py -3 -m venv $venvPath
+    & python -m venv $venvPath
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to create the virtual environment.'
     }

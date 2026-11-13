@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import argparse
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from openpyxl import load_workbook
+from openpyxl.utils.cell import range_boundaries
 import pandas as pd
 
 MIN_POST_DATE = pd.Timestamp("2022-01-01")
@@ -108,7 +111,14 @@ PATH_REGISTRY_SOURCE_MAP: Dict[str, str] = {
 }
 
 PATH_REGISTRY_OUTPUT_KEY = "All Transactions"
+PATH_REGISTRY_EXCLUDED_OUTPUT_KEY = "Excluded Transactions"
 PATH_REGISTRY_SEARCH_ROOT_KEY = "Search Root"
+
+
+@dataclass(frozen=True)
+class WorkbookTableData:
+    fullname: Path
+    tables: Dict[str, pd.DataFrame]
 
 
 def remove_visa(txn_description: str) -> str:
@@ -128,7 +138,7 @@ def parse_money(value: object) -> Optional[float]:
         return None
 
     # Handles values like "- $20.42", "$456.68", "($42.00)", "-300".
-    sign = -1 if text.startswith("-") or "(" in text else 1
+    sign = -1 if "-" in text or "(" in text else 1
     cleaned = re.sub(r"[^0-9.]", "", text)
     if not cleaned:
         return None
@@ -346,6 +356,50 @@ def select_column_by_keyword_groups(
     return None
 
 
+def load_workbook_table_data(
+    workbook_path: Path,
+    table_names: Iterable[str] = WORKBOOK_RULE_TABLES.values(),
+) -> WorkbookTableData:
+    """Load configured Excel tables from a saved workbook for non-Excel CLI runs."""
+    path = Path(workbook_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Workbook file does not exist: {path}")
+
+    requested_tables = set(table_names)
+    workbook = load_workbook(path, data_only=True, read_only=False)
+    tables: Dict[str, pd.DataFrame] = {}
+    try:
+        for sheet in workbook.worksheets:
+            for table_name in requested_tables.intersection(sheet.tables):
+                table = sheet.tables[table_name]
+                if table.headerRowCount not in (None, 1):
+                    raise ValueError(
+                        f"Workbook table must have one header row: {table_name}"
+                    )
+
+                min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+                rows = sheet.iter_rows(
+                    min_row=min_row,
+                    max_row=max_row,
+                    min_col=min_col,
+                    max_col=max_col,
+                    values_only=True,
+                )
+                headers = next(rows, None)
+                if headers is None:
+                    tables[table_name] = pd.DataFrame()
+                    continue
+
+                columns = [str(value).strip() if value is not None else "" for value in headers]
+                frame = pd.DataFrame(list(rows), columns=columns)
+                frame = frame.dropna(how="all").reset_index(drop=True)
+                tables[table_name] = frame
+    finally:
+        workbook.close()
+
+    return WorkbookTableData(fullname=path, tables=tables)
+
+
 def find_workbook_table(workbook: Any, table_name: str) -> Tuple[str, Any]:
     for sheet in workbook.sheets:
         try:
@@ -357,17 +411,22 @@ def find_workbook_table(workbook: Any, table_name: str) -> Tuple[str, Any]:
 
 
 def read_workbook_table_as_dataframe(workbook: Any, table_name: str) -> pd.DataFrame:
-    _, table = find_workbook_table(workbook, table_name)
+    if isinstance(workbook, WorkbookTableData):
+        if table_name not in workbook.tables:
+            raise KeyError(f"Workbook table not found: {table_name}")
+        df = workbook.tables[table_name].copy()
+    else:
+        _, table = find_workbook_table(workbook, table_name)
 
-    df = table.range.options(pd.DataFrame, header=1, index=False).value
-    if df is None:
-        return pd.DataFrame()
+        df = table.range.options(pd.DataFrame, header=1, index=False).value
+        if df is None:
+            return pd.DataFrame()
 
-    if isinstance(df, pd.Series):
-        df = df.to_frame()
+        if isinstance(df, pd.Series):
+            df = df.to_frame()
 
-    if not isinstance(df, pd.DataFrame):
-        return pd.DataFrame()
+        if not isinstance(df, pd.DataFrame):
+            return pd.DataFrame()
 
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
@@ -522,8 +581,8 @@ def load_source_paths_from_workbook(workbook: Any) -> Dict[str, Path]:
     return result
 
 
-def load_output_path_from_workbook(workbook: Any) -> Optional[Path]:
-    """Read the All Transactions output path from the PathRegistry workbook table."""
+def load_path_from_workbook(workbook: Any, data_source_key: str) -> Optional[Path]:
+    """Read a configured path from the PathRegistry workbook table."""
     df = read_workbook_table_as_dataframe(workbook, WORKBOOK_RULE_TABLES["path_registry"])
     if df.empty:
         return None
@@ -537,31 +596,25 @@ def load_output_path_from_workbook(workbook: Any) -> Optional[Path]:
     for _, row in df.iterrows():
         data_source = normalize_text(row.get(source_col))
         raw_path = normalize_text(row.get(path_col))
-        if data_source == PATH_REGISTRY_OUTPUT_KEY and raw_path:
+        if data_source == data_source_key and raw_path:
             return Path(raw_path)
 
     return None
+
+
+def load_output_path_from_workbook(workbook: Any) -> Optional[Path]:
+    """Read the All Transactions output path from the PathRegistry workbook table."""
+    return load_path_from_workbook(workbook, PATH_REGISTRY_OUTPUT_KEY)
+
+
+def load_excluded_output_path_from_workbook(workbook: Any) -> Optional[Path]:
+    """Read the excluded-transactions output path from PathRegistry."""
+    return load_path_from_workbook(workbook, PATH_REGISTRY_EXCLUDED_OUTPUT_KEY)
 
 
 def load_search_root_from_workbook(workbook: Any) -> Optional[Path]:
     """Read the Search Root path from the PathRegistry workbook table."""
-    df = read_workbook_table_as_dataframe(workbook, WORKBOOK_RULE_TABLES["path_registry"])
-    if df.empty:
-        return None
-
-    source_col = select_column_by_keyword_groups(df.columns, (("data", "source"), ("source",), ("data",))) or df.columns[0]
-    path_col = select_column_by_keyword_groups(df.columns, (("path",),)) or (df.columns[1] if len(df.columns) > 1 else None)
-
-    if path_col is None:
-        return None
-
-    for _, row in df.iterrows():
-        data_source = normalize_text(row.get(source_col))
-        raw_path = normalize_text(row.get(path_col))
-        if data_source == PATH_REGISTRY_SEARCH_ROOT_KEY and raw_path:
-            return Path(raw_path)
-
-    return None
+    return load_path_from_workbook(workbook, PATH_REGISTRY_SEARCH_ROOT_KEY)
 
 
 def load_event_replacements_from_workbook(
@@ -894,6 +947,21 @@ def apply_original_rules_with_exclusions(
     return to_standard_frame(df), excluded[OUTPUT_COLUMNS + ["Exclusion Reason"]]
 
 
+def apply_minimum_post_date(
+    all_txns: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply the minimum post date and report transactions with unparseable dates."""
+    df = all_txns.copy()
+    df["Post Date Sort"] = pd.to_datetime(df["Post Date"], errors="coerce")
+    included_by_date = df["Post Date Sort"] >= MIN_POST_DATE
+    excluded = df.loc[df["Post Date Sort"].isna()].copy()
+    excluded["Exclusion Reason"] = "Post Date could not be parsed"
+    included = df.loc[included_by_date].copy()
+    included = included.sort_values(by="Post Date Sort", ascending=False)
+    included = included.drop(columns=["Post Date Sort"])
+    return to_standard_frame(included), excluded[OUTPUT_COLUMNS + ["Exclusion Reason"]]
+
+
 def load_firstbank(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
 
@@ -1067,6 +1135,18 @@ def load_pnc_cash_rewards_visa(path: Path) -> pd.DataFrame:
         df["Income or Expense"] = df["Credit_Debit_Ind"].apply(
             lambda x: "Income" if x == "Credit" else "Expense"
         )
+
+    reward_text = df["DescriptionClean"]
+    if type_col:
+        reward_text = reward_text + " " + df[type_col].fillna("").astype(str)
+    is_reward_redemption = (
+        reward_text.str.contains(r"\bPNC\s+CASH\s+REWARDS?\b", case=False, regex=True)
+        | (
+            reward_text.str.contains(r"\b(?:rewards?|cash\s*back|cashback)\b", case=False, regex=True)
+            & reward_text.str.contains(r"\b(?:redeem(?:ed|ing)?|redemption)\b", case=False, regex=True)
+        )
+    )
+    df.loc[is_reward_redemption, "Income or Expense"] = "Income"
 
     missing_txn = df["TxnDate"].isna()
     df.loc[missing_txn, "TxnDate"] = df.loc[missing_txn, "PostDate"]
@@ -1392,8 +1472,111 @@ def resolve_search_root(cli_search_root: str, workbook: Optional[Any] = None) ->
     return Path.cwd()
 
 
-def parse_args() -> argparse.Namespace:
+def resolve_output_path(cli_output: str, workbook: Optional[Any] = None) -> Path:
+    """Resolve output path from CLI override, workbook PathRegistry, then default."""
+    if cli_output:
+        return Path(cli_output)
+
+    if workbook is not None:
+        workbook_output_path = load_output_path_from_workbook(workbook)
+        if workbook_output_path:
+            return workbook_output_path
+
+    return Path("All Transactions.csv")
+
+
+def resolve_excluded_output_path(
+    cli_output: str,
+    output_path: Path,
+    workbook: Optional[Any] = None,
+) -> Path:
+    """Resolve excluded output path from CLI override, workbook PathRegistry, then default."""
+    if cli_output:
+        return Path(cli_output)
+
+    if workbook is not None:
+        workbook_output_path = load_excluded_output_path_from_workbook(workbook)
+        if workbook_output_path:
+            return workbook_output_path
+
+    return output_path.with_name(f"{output_path.stem} - Excluded{output_path.suffix or '.csv'}")
+
+
+def build_all_transactions_from_workbook(
+    workbook: Any,
+    search_root: Optional[Path] = None,
+    output_path: Optional[Path] = None,
+    excluded_output_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    """Run the full workbook-configured pipeline and write both output CSVs."""
+    source_paths = load_source_paths_from_workbook(workbook)
+    if search_root is not None:
+        source_paths = resolve_source_paths(REQUIRED_SOURCES, search_root, source_paths)
+    else:
+        missing_sources = [name for name in REQUIRED_SOURCES if name not in source_paths]
+        if missing_sources:
+            raise FileNotFoundError(
+                "Could not find all required CSV paths in PathRegistry. Missing:\n- "
+                + "\n- ".join(missing_sources)
+            )
+
+    output_path = output_path or load_output_path_from_workbook(workbook)
+    if output_path is None:
+        workbook_path = Path(getattr(workbook, "fullname", Path.cwd()))
+        output_path = workbook_path.parent / "All Transactions.csv"
+
+    excluded_output_path = excluded_output_path or load_excluded_output_path_from_workbook(workbook)
+    if excluded_output_path is None:
+        excluded_output_path = output_path.with_name(
+            f"{output_path.stem} - Excluded{output_path.suffix or '.csv'}"
+        )
+
+    print(f"Output path: {output_path}")
+    print(f"Excluded output path: {excluded_output_path}")
+    print(f"Resolved {len(source_paths):,} source paths from PathRegistry")
+
+    all_txns = build_all_transactions(source_paths)
+    description_lookup = load_description_lookup_from_workbook(workbook)
+    description_excludes = load_description_excludes_from_workbook(workbook)
+    manual_categories = load_manual_categories_from_workbook(workbook)
+    transaction_excludes = load_transaction_excludes_from_workbook(workbook)
+    event_replacements = load_event_replacements_from_workbook(workbook)
+
+    all_txns, excluded_txns = apply_original_rules_with_exclusions(
+        all_txns,
+        description_lookup,
+        description_excludes,
+        manual_categories,
+        transaction_excludes,
+    )
+    if not event_replacements.empty:
+        all_txns = pd.concat([all_txns, event_replacements], ignore_index=True)
+
+    rows_before_date_filter = len(all_txns)
+    all_txns, date_excluded = apply_minimum_post_date(all_txns)
+    date_floor_count = rows_before_date_filter - len(all_txns) - len(date_excluded)
+    if not date_excluded.empty:
+        excluded_txns = pd.concat([excluded_txns, date_excluded], ignore_index=True)
+
+    all_txns.to_csv(output_path, index=False)
+    excluded_txns.to_csv(excluded_output_path, index=False)
+
+    print(f"Wrote {len(all_txns):,} rows to {output_path.resolve()}")
+    print(
+        f"Wrote {len(excluded_txns):,} excluded rows to {excluded_output_path.resolve()} "
+        f"(date-floor rows not written: {date_floor_count:,})"
+    )
+    return all_txns
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build All Transactions.csv from source exports")
+    parser.add_argument(
+        "--workbook",
+        type=str,
+        default="",
+        help="Excel workbook whose named tables configure source paths and pipeline rules.",
+    )
     parser.add_argument(
         "--search-root",
         type=str,
@@ -1403,8 +1586,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=str,
-        default="All Transactions.csv",
-        help="Output CSV path (default: ./All Transactions.csv)",
+        default="",
+        help="Output CSV path (default: PathRegistry in workbook, otherwise ./All Transactions.csv)",
     )
     parser.add_argument(
         "--excluded-output",
@@ -1442,18 +1625,44 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional CSV path for one-off replacement transactions to append to output.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main(workbook: Optional[Any] = None) -> None:
     args = parse_args()
+    if args.workbook:
+        if workbook is not None:
+            raise ValueError("Pass either a workbook object or --workbook, not both.")
+        if any(
+            (
+                args.description_lookup,
+                args.description_excludes,
+                args.manual_categories,
+                args.transaction_excludes,
+                args.event_replacements,
+            )
+        ):
+            raise ValueError(
+                "CSV rule options cannot be combined with --workbook; "
+                "use the workbook's rule tables instead."
+            )
+
+        workbook_data = load_workbook_table_data(Path(args.workbook))
+        search_root = resolve_search_root(args.search_root, workbook_data)
+        if not search_root.exists():
+            raise FileNotFoundError(f"Search root does not exist: {search_root}")
+
+        build_all_transactions_from_workbook(
+            workbook_data,
+            search_root=search_root,
+            output_path=Path(args.output) if args.output else None,
+            excluded_output_path=Path(args.excluded_output) if args.excluded_output else None,
+        )
+        return
+
     search_root = resolve_search_root(args.search_root, workbook)
-    output_path = Path(args.output)
-    excluded_output_path = (
-        Path(args.excluded_output)
-        if args.excluded_output
-        else output_path.with_name(f"{output_path.stem} - Excluded{output_path.suffix or '.csv'}")
-    )
+    output_path = resolve_output_path(args.output, workbook)
+    excluded_output_path = resolve_excluded_output_path(args.excluded_output, output_path, workbook)
 
     if not search_root.exists():
         raise FileNotFoundError(f"Search root does not exist: {search_root}")
@@ -1506,29 +1715,23 @@ def main(workbook: Optional[Any] = None) -> None:
     if not event_replacements.empty:
         all_txns = pd.concat([all_txns, event_replacements], ignore_index=True)
 
-    all_txns["Post Date Sort"] = pd.to_datetime(all_txns["Post Date"], errors="coerce")
-    included_by_date = all_txns["Post Date Sort"] >= MIN_POST_DATE
-    date_excluded = all_txns.loc[~included_by_date].copy()
-    date_excluded["Exclusion Reason"] = date_excluded["Post Date Sort"].apply(
-        lambda post_date: (
-            f"Post Date before {MIN_POST_DATE.strftime('%Y-%m-%d')}"
-            if pd.notna(post_date)
-            else "Post Date could not be parsed"
-        )
-    )
+    rows_before_date_filter = len(all_txns)
+    all_txns, date_excluded = apply_minimum_post_date(all_txns)
+    date_floor_count = rows_before_date_filter - len(all_txns) - len(date_excluded)
     if not date_excluded.empty:
         excluded_txns = pd.concat(
-            [excluded_txns, date_excluded[OUTPUT_COLUMNS + ["Exclusion Reason"]]],
+            [excluded_txns, date_excluded],
             ignore_index=True,
         )
-    all_txns = all_txns.loc[included_by_date].copy()
-    all_txns = all_txns.sort_values(by="Post Date Sort", ascending=False).drop(columns=["Post Date Sort"])
 
     all_txns.to_csv(output_path, index=False)
     excluded_txns.to_csv(excluded_output_path, index=False)
 
     print(f"Wrote {len(all_txns):,} rows to {output_path.resolve()}")
-    print(f"Wrote {len(excluded_txns):,} excluded rows to {excluded_output_path.resolve()}")
+    print(
+        f"Wrote {len(excluded_txns):,} excluded rows to {excluded_output_path.resolve()} "
+        f"(date-floor rows not written: {date_floor_count:,})"
+    )
     print(f"Description lookup rows applied: {len(description_lookup):,}")
     print(f"Description excludes loaded: {len(description_excludes):,}")
     print(f"Manual category rules loaded: {len(manual_categories):,}")

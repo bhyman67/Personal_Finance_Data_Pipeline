@@ -32,13 +32,9 @@ No activation is needed if you run `.venv\Scripts\pf-build-all-transactions.exe`
 
 ## Workbook-Driven CLI
 
-This pipeline supports command-line runs configured from either CSV rule files or tables in a saved Excel workbook. Existing integrations can also pass a live workbook object.
+This pipeline runs from a saved Excel workbook. The workbook supplies rule tables, while `PATHS.json` supplies the workbook, source-file, and output paths. Existing integrations can also pass a live workbook object.
 
-In workbook-driven usage, the `--workbook` option reads the workbook's named tables directly, without requiring the xlwings Run button or a workbook-local runner. The PathRegistry table can provide explicit source file paths, set the `All Transactions` and `Excluded Transactions` output paths, and provide a search root; any missing source files can still be discovered via search-root fallback.
-
-Path resolution order is explicit source-path mappings first (when provided by workbook integration), then recursive search under a configured search root.
-
-If required source files are still missing after resolution, the run fails with a clear missing-files error.
+The `--workbook` option reads the workbook's named rule tables directly, without requiring the xlwings Run button or a workbook-local runner. All required source files must have explicit entries in `PATHS.json`; the pipeline does not scan folders to discover them.
 
 This keeps workbook-based configuration while allowing the pipeline to be launched and maintained entirely from the repository.
 
@@ -48,9 +44,15 @@ Run a workbook-configured build from the repository environment:
 .\.venv\Scripts\pf-build-all-transactions.exe --workbook "D:\path\to\Money_Management.xlsx"
 ```
 
-Alternatively, run `.\.venv\Scripts\python.exe -m personal_finance_data_pipeline.cli --workbook "<workbook path>"`. Save the workbook before running; the command reads the saved file. `--search-root`, `--output`, and `--excluded-output` override their PathRegistry values. With `--workbook`, rule configuration comes from the workbook tables; CSV rule options are for runs without `--workbook`.
+Alternatively, run `.\.venv\Scripts\python.exe -m personal_finance_data_pipeline.cli --workbook "<workbook path>"`. Save the workbook before running; the command reads the saved file. The workbook path can be omitted when `Workbook` is configured in `PATHS.json`. `--output` and `--excluded-output` override the corresponding paths from `PATHS.json`.
 
-The excluded-transactions file uses the `Excluded Transactions` path in PathRegistry when configured. Otherwise, it is written next to the main output as `<output name> - Excluded.csv`. For command-line runs, use `--excluded-output` to choose a different path. It records transactions excluded by the description-exclude rules or transaction-exclude rules, as well as transactions with unparseable post dates that reach the final date filter. Transactions excluded solely because they precede the minimum post date are omitted; rule-excluded transactions are still recorded regardless of their date. The output message reports how many date-floor exclusions were omitted. Rows discarded inside source-specific parsing (for example, invalid dates or amounts) are not included.
+The excluded-transactions file uses the `Excluded Transactions` path in `PATHS.json` when configured. Otherwise, it is written next to the main output as `<output name> - Excluded.csv`. For command-line runs, use `--excluded-output` to choose a different path. It records transactions excluded by the description-exclude rules or transaction-exclude rules, as well as transactions with unparseable post dates that reach the final date filter. Transactions excluded solely because they precede the minimum post date are omitted; rule-excluded transactions are still recorded regardless of their date. The output message reports how many date-floor exclusions were omitted. Rows discarded inside source-specific parsing (for example, invalid dates or amounts) are not included.
+
+## Shared Path Configuration
+
+If a `PATHS.json` file exists in the folder named by the `ONEDRIVE` environment variable, the CLI reads it so the same configuration works on every computer with its own OneDrive location. Its `personal_financial_data_pipeline` section lists each path relative to that folder: `Workbook`, `All Transactions`, `Excluded Transactions`, and every required source file. There is no search-root setting; missing or invalid source paths cause the run to fail.
+
+Command-line options override the corresponding `PATHS.json` values. Paths are not read from the workbook, so the workbook needs no PathRegistry table. Rule tables are always read from the workbook. Entries marked `Inactive` are still read: those sources are no longer updated, but their historical data is still included.
 
 ## Output Schema
 

@@ -16,6 +16,8 @@ Output columns:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,39 +62,23 @@ REQUIRED_SOURCES: Sequence[str] = [
     "Robinhood - Savings - Transactions.csv",
 ]
 
-OPTIONAL_RULE_FILES: Dict[str, Sequence[str]] = {
-    "description_lookup": (
-        "Description Category Lookup.csv",
-        "Description Category Lookup - Table.csv",
-    ),
-    "description_excludes": (
-        "Description Exclude List.csv",
-        "Description Excludes.csv",
-    ),
-    "manual_categories": (
-        "Manual Description Categorizations.csv",
-        "Manual Description Categorization.csv",
-    ),
-    "transaction_excludes": (
-        "Transaction Excludes.csv",
-    ),
-    "event_replacements": (
-        "Event Replacements.csv",
-    ),
-}
-
 WORKBOOK_RULE_TABLES: Dict[str, str] = {
     "transaction_excludes": "TransactionExcludes",
     "description_lookup": "DescriptionCategoryLookup",
     "description_excludes": "DescriptionExcludes",
     "event_replacements": "EventReplacements",
     "manual_category_override": "ManualCategoryOverride",
-    "path_registry": "PathRegistry",
 }
 
-# Maps PathRegistry "Data Source" column values to REQUIRED_SOURCES keys.
-# Update this map if PathRegistry row names ever change.
-PATH_REGISTRY_SOURCE_MAP: Dict[str, str] = {
+# Shared OneDrive config: paths are relative to the ONEDRIVE environment variable.
+PATHS_CONFIG_FILENAME = "PATHS.json"
+PATHS_CONFIG_SECTION = "personal_financial_data_pipeline"
+PATHS_CONFIG_WORKBOOK_KEY = "Workbook"
+PATHS_OUTPUT_KEY = "All Transactions"
+PATHS_EXCLUDED_OUTPUT_KEY = "Excluded Transactions"
+
+# Maps PATHS.json source entry names to REQUIRED_SOURCES keys.
+PATHS_SOURCE_MAP: Dict[str, str] = {
     "FirstBank All Accounts Transactions": "FirstBank - All Accounts - Transactions.csv",
     "FirstBank Gold Visa Transactions": "FirstBank - Gold Visa - Transactions.csv",
     "PNC Spending Transactions": "PNC - accountActivityExport - Spending.csv",
@@ -109,10 +95,6 @@ PATH_REGISTRY_SOURCE_MAP: Dict[str, str] = {
     "Robinhood Checking Transactions": "Robinhood - Checking - Transactions.csv",
     "Robinhood Savings Transactions": "Robinhood - Savings - Transactions.csv",
 }
-
-PATH_REGISTRY_OUTPUT_KEY = "All Transactions"
-PATH_REGISTRY_EXCLUDED_OUTPUT_KEY = "Excluded Transactions"
-PATH_REGISTRY_SEARCH_ROOT_KEY = "Search Root"
 
 
 @dataclass(frozen=True)
@@ -330,14 +312,6 @@ def normalize_amount(value: object) -> Optional[float]:
         return None
 
 
-def find_first_existing_file(search_root: Path, candidate_names: Sequence[str]) -> Optional[Path]:
-    for candidate in candidate_names:
-        matches = list(search_root.rglob(candidate))
-        if matches:
-            return matches[0]
-    return None
-
-
 def select_first_column_by_keywords(columns: Sequence[str], keywords: Sequence[str]) -> Optional[str]:
     lowered = {c: c.lower() for c in columns}
     for col, col_lower in lowered.items():
@@ -551,70 +525,35 @@ def load_transaction_excludes_from_workbook(
     return out.reset_index(drop=True)
 
 
-def load_source_paths_from_workbook(workbook: Any) -> Dict[str, Path]:
-    """Read source CSV paths from the PathRegistry workbook table.
+def load_paths_config() -> Dict[str, Path]:
+    """Read pipeline paths from PATHS.json in the ONEDRIVE folder.
 
-    Returns a dict keyed by REQUIRED_SOURCES names (same keys used by
-    build_all_transactions), with resolved Path values from the Path column.
-    Rows whose Data Source name is not in PATH_REGISTRY_SOURCE_MAP are ignored.
+    Returns an empty dict when ONEDRIVE is unset or the file does not exist.
+    Each entry's relative path is resolved against the ONEDRIVE folder.
     """
-    df = read_workbook_table_as_dataframe(workbook, WORKBOOK_RULE_TABLES["path_registry"])
-    if df.empty:
+    onedrive = os.environ.get("ONEDRIVE")
+    if not onedrive:
         return {}
 
-    source_col = select_column_by_keyword_groups(df.columns, (("data", "source"), ("source",), ("data",))) or df.columns[0]
-    path_col = select_column_by_keyword_groups(df.columns, (("path",),)) or (df.columns[1] if len(df.columns) > 1 else None)
-
-    if path_col is None:
+    config_path = Path(onedrive) / PATHS_CONFIG_FILENAME
+    if not config_path.is_file():
         return {}
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{config_path} is not valid JSON: {exc}") from exc
+
+    section = data.get(PATHS_CONFIG_SECTION) if isinstance(data, dict) else None
+    if not isinstance(section, dict):
+        raise ValueError(f"{config_path} is missing the '{PATHS_CONFIG_SECTION}' section.")
 
     result: Dict[str, Path] = {}
-    for _, row in df.iterrows():
-        data_source = normalize_text(row.get(source_col))
-        raw_path = normalize_text(row.get(path_col))
-        if not data_source or not raw_path:
-            continue
-        source_key = PATH_REGISTRY_SOURCE_MAP.get(data_source)
-        if source_key:
-            result[source_key] = Path(raw_path)
-
+    for name, entry in section.items():
+        raw_path = entry.get("path") if isinstance(entry, dict) else None
+        if raw_path:
+            result[name] = Path(onedrive) / raw_path
     return result
-
-
-def load_path_from_workbook(workbook: Any, data_source_key: str) -> Optional[Path]:
-    """Read a configured path from the PathRegistry workbook table."""
-    df = read_workbook_table_as_dataframe(workbook, WORKBOOK_RULE_TABLES["path_registry"])
-    if df.empty:
-        return None
-
-    source_col = select_column_by_keyword_groups(df.columns, (("data", "source"), ("source",), ("data",))) or df.columns[0]
-    path_col = select_column_by_keyword_groups(df.columns, (("path",),)) or (df.columns[1] if len(df.columns) > 1 else None)
-
-    if path_col is None:
-        return None
-
-    for _, row in df.iterrows():
-        data_source = normalize_text(row.get(source_col))
-        raw_path = normalize_text(row.get(path_col))
-        if data_source == data_source_key and raw_path:
-            return Path(raw_path)
-
-    return None
-
-
-def load_output_path_from_workbook(workbook: Any) -> Optional[Path]:
-    """Read the All Transactions output path from the PathRegistry workbook table."""
-    return load_path_from_workbook(workbook, PATH_REGISTRY_OUTPUT_KEY)
-
-
-def load_excluded_output_path_from_workbook(workbook: Any) -> Optional[Path]:
-    """Read the excluded-transactions output path from PathRegistry."""
-    return load_path_from_workbook(workbook, PATH_REGISTRY_EXCLUDED_OUTPUT_KEY)
-
-
-def load_search_root_from_workbook(workbook: Any) -> Optional[Path]:
-    """Read the Search Root path from the PathRegistry workbook table."""
-    return load_path_from_workbook(workbook, PATH_REGISTRY_SEARCH_ROOT_KEY)
 
 
 def load_event_replacements_from_workbook(
@@ -664,174 +603,6 @@ def load_event_replacements_from_workbook(
     out = out[out["Amount"].notna()]
     out = out[out["Description"].str.len() > 0]
 
-    missing_txn_date = out["Transaction Date"].astype(str).str.len() == 0
-    out.loc[missing_txn_date, "Transaction Date"] = out.loc[missing_txn_date, "Post Date"]
-
-    return to_standard_frame(out.reset_index(drop=True))
-
-
-def load_description_lookup(path: Optional[Path]) -> Dict[str, str]:
-    if path is None or not path.exists():
-        return {}
-
-    df = pd.read_csv(path)
-    if df.empty:
-        return {}
-
-    key_col = select_first_column_by_keywords(df.columns, ["description"]) or df.columns[0]
-    val_col = (
-        select_first_column_by_keywords(df.columns, ["category"])
-        or (df.columns[1] if len(df.columns) > 1 else None)
-    )
-    if val_col is None:
-        return {}
-
-    lookup: Dict[str, str] = {}
-    for _, row in df.iterrows():
-        key = normalize_text(row.get(key_col))
-        value = normalize_text(row.get(val_col))
-        if key:
-            lookup[key] = value
-    return lookup
-
-
-def load_description_excludes(path: Optional[Path]) -> List[str]:
-    if path is None or not path.exists():
-        return []
-
-    df = pd.read_csv(path)
-    if df.empty:
-        return []
-
-    col = df.columns[0]
-    return [normalize_text(v) for v in df[col].tolist() if normalize_text(v)]
-
-
-def load_manual_categories(path: Optional[Path]) -> pd.DataFrame:
-    if path is None or not path.exists():
-        return pd.DataFrame(columns=["Date", "Amount", "Description", "Description Category"])
-
-    df = pd.read_csv(path)
-    if df.empty:
-        return pd.DataFrame(columns=["Date", "Amount", "Description", "Description Category"])
-
-    date_col = select_first_column_by_keywords(df.columns, ["date"]) or df.columns[0]
-    amount_col = select_first_column_by_keywords(df.columns, ["amount"]) or (
-        df.columns[1] if len(df.columns) > 1 else df.columns[0]
-    )
-    description_col = select_first_column_by_keywords(df.columns, ["description"]) or (
-        df.columns[2] if len(df.columns) > 2 else df.columns[0]
-    )
-    category_col = select_first_column_by_keywords(df.columns, ["category"]) or (
-        df.columns[3] if len(df.columns) > 3 else None
-    )
-
-    if category_col is None:
-        return pd.DataFrame(columns=["Date", "Amount", "Description", "Description Category"])
-
-    out = pd.DataFrame(
-        {
-            "Date": df[date_col].apply(parse_date).apply(format_mmddyyyy),
-            "Amount": df[amount_col].apply(parse_money),
-            "Description": df[description_col].apply(normalize_text),
-            "Description Category": df[category_col].apply(normalize_text),
-        }
-    )
-    out["Amount"] = out["Amount"].apply(normalize_amount)
-    out = out[out["Date"].astype(str).str.len() > 0]
-    out = out[out["Amount"].notna()]
-    out = out[out["Description"].str.len() > 0]
-    return out.reset_index(drop=True)
-
-
-def load_transaction_excludes(path: Optional[Path]) -> pd.DataFrame:
-    if path is None or not path.exists():
-        return pd.DataFrame(columns=["Date", "Amount", "Description", "Income or Expense"])
-
-    df = pd.read_csv(path)
-    if df.empty:
-        return pd.DataFrame(columns=["Date", "Amount", "Description", "Income or Expense"])
-
-    date_col = select_first_column_by_keywords(df.columns, ["date"]) or df.columns[0]
-    amount_col = select_first_column_by_keywords(df.columns, ["amount"]) or (
-        df.columns[1] if len(df.columns) > 1 else df.columns[0]
-    )
-    description_col = select_first_column_by_keywords(df.columns, ["description"]) or (
-        df.columns[2] if len(df.columns) > 2 else df.columns[0]
-    )
-    inc_exp_col = select_first_column_by_keywords(df.columns, ["income", "expense"]) or (
-        df.columns[3] if len(df.columns) > 3 else None
-    )
-
-    if inc_exp_col is None:
-        return pd.DataFrame(columns=["Date", "Amount", "Description", "Income or Expense"])
-
-    out = pd.DataFrame(
-        {
-            "Date": df[date_col].apply(parse_date).apply(format_mmddyyyy),
-            "Amount": df[amount_col].apply(parse_money),
-            "Description": df[description_col].apply(normalize_text),
-            "Income or Expense": df[inc_exp_col].apply(normalize_text),
-        }
-    )
-    out["Amount"] = out["Amount"].apply(normalize_amount)
-    out = out[out["Date"].astype(str).str.len() > 0]
-    out = out[out["Amount"].notna()]
-    out = out[out["Description"].str.len() > 0]
-    out = out[out["Income or Expense"].str.len() > 0]
-    return out.reset_index(drop=True)
-
-
-def load_event_replacements(path: Optional[Path]) -> pd.DataFrame:
-    if path is None or not path.exists():
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
-
-    df = pd.read_csv(path)
-    if df.empty:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
-
-    post_date_col = select_first_column_by_keywords(df.columns, ["post", "date"]) or (
-        select_first_column_by_keywords(df.columns, ["date"]) or df.columns[0]
-    )
-    txn_date_col = select_first_column_by_keywords(df.columns, ["transaction", "date"]) or post_date_col
-    account_col = select_first_column_by_keywords(df.columns, ["account"]) or (
-        df.columns[1] if len(df.columns) > 1 else df.columns[0]
-    )
-    amount_col = select_first_column_by_keywords(df.columns, ["amount"]) or (
-        df.columns[2] if len(df.columns) > 2 else df.columns[0]
-    )
-    description_col = select_first_column_by_keywords(df.columns, ["description"]) or (
-        df.columns[3] if len(df.columns) > 3 else df.columns[0]
-    )
-    type_col = select_first_column_by_keywords(df.columns, ["type"]) or (
-        df.columns[4] if len(df.columns) > 4 else None
-    )
-    inc_exp_col = select_first_column_by_keywords(df.columns, ["income", "expense"]) or (
-        df.columns[5] if len(df.columns) > 5 else None
-    )
-    category_col = select_first_column_by_keywords(df.columns, ["category"]) or (
-        df.columns[6] if len(df.columns) > 6 else None
-    )
-
-    out = pd.DataFrame(
-        {
-            "Post Date": df[post_date_col].apply(parse_date).apply(format_mmddyyyy),
-            "Transaction Date": df[txn_date_col].apply(parse_date).apply(format_mmddyyyy),
-            "Account": df[account_col].apply(normalize_text),
-            "Amount": df[amount_col].apply(parse_money),
-            "Description": df[description_col].apply(normalize_text),
-            "Type": df[type_col].apply(normalize_text) if type_col else "MANUAL ADJUSTMENT",
-            "Income or Expense": df[inc_exp_col].apply(normalize_text) if inc_exp_col else "Expense",
-            "Description Category": df[category_col].apply(normalize_text) if category_col else "",
-        }
-    )
-
-    out["Amount"] = out["Amount"].apply(normalize_amount)
-    out = out[out["Post Date"].astype(str).str.len() > 0]
-    out = out[out["Amount"].notna()]
-    out = out[out["Description"].str.len() > 0]
-
-    # Default transaction date to post date if omitted.
     missing_txn_date = out["Transaction Date"].astype(str).str.len() == 0
     out.loc[missing_txn_date, "Transaction Date"] = out.loc[missing_txn_date, "Post Date"]
 
@@ -1390,17 +1161,6 @@ def load_rh_account_csv(path: Path, account_name: str) -> pd.DataFrame:
     return to_standard_frame(out)
 
 
-def find_source_files(search_root: Path, required_sources: Iterable[str]) -> Dict[str, Path]:
-    source_lookup: Dict[str, Path] = {}
-    names = set(required_sources)
-
-    for path in search_root.rglob("*.csv"):
-        if path.name in names and path.name not in source_lookup:
-            source_lookup[path.name] = path
-
-    return source_lookup
-
-
 def build_all_transactions(source_paths: Dict[str, Path]) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
 
@@ -1432,100 +1192,38 @@ def build_all_transactions(source_paths: Dict[str, Path]) -> pd.DataFrame:
     return to_standard_frame(all_txns)
 
 
-def resolve_source_paths(
-    required_sources: Iterable[str],
-    search_root: Path,
-    explicit_source_paths: Optional[Dict[str, Path]] = None,
-) -> Dict[str, Path]:
-    """Resolve required source files from explicit paths first, then search-root scan."""
-    source_paths: Dict[str, Path] = {}
-
-    for name in required_sources:
-        explicit = (explicit_source_paths or {}).get(name)
-        if explicit and explicit.exists():
-            source_paths[name] = explicit
-
-    missing = [name for name in required_sources if name not in source_paths]
-    if missing:
-        discovered = find_source_files(search_root, missing)
-        source_paths.update(discovered)
-
-    final_missing = [name for name in required_sources if name not in source_paths]
-    if final_missing:
-        raise FileNotFoundError(
-            "Could not find all required CSV files. Missing:\n- " + "\n- ".join(final_missing)
-        )
-
-    return source_paths
-
-
-def resolve_search_root(cli_search_root: str, workbook: Optional[Any] = None) -> Path:
-    """Resolve search root from CLI override, workbook PathRegistry, then cwd."""
-    if cli_search_root:
-        return Path(cli_search_root)
-
-    if workbook is not None:
-        workbook_search_root = load_search_root_from_workbook(workbook)
-        if workbook_search_root:
-            return workbook_search_root
-
-    return Path.cwd()
-
-
-def resolve_output_path(cli_output: str, workbook: Optional[Any] = None) -> Path:
-    """Resolve output path from CLI override, workbook PathRegistry, then default."""
-    if cli_output:
-        return Path(cli_output)
-
-    if workbook is not None:
-        workbook_output_path = load_output_path_from_workbook(workbook)
-        if workbook_output_path:
-            return workbook_output_path
-
-    return Path("All Transactions.csv")
-
-
-def resolve_excluded_output_path(
-    cli_output: str,
-    output_path: Path,
-    workbook: Optional[Any] = None,
-) -> Path:
-    """Resolve excluded output path from CLI override, workbook PathRegistry, then default."""
-    if cli_output:
-        return Path(cli_output)
-
-    if workbook is not None:
-        workbook_output_path = load_excluded_output_path_from_workbook(workbook)
-        if workbook_output_path:
-            return workbook_output_path
-
-    return output_path.with_name(f"{output_path.stem} - Excluded{output_path.suffix or '.csv'}")
+def source_paths_from_config(paths_config: Dict[str, Path]) -> Dict[str, Path]:
+    """Map PATHS.json source entries to REQUIRED_SOURCES keys."""
+    return {
+        PATHS_SOURCE_MAP[name]: path
+        for name, path in paths_config.items()
+        if name in PATHS_SOURCE_MAP
+    }
 
 
 def build_all_transactions_from_workbook(
     workbook: Any,
-    search_root: Optional[Path] = None,
     output_path: Optional[Path] = None,
     excluded_output_path: Optional[Path] = None,
+    source_paths: Optional[Dict[str, Path]] = None,
 ) -> pd.DataFrame:
     """Run the full workbook-configured pipeline and write both output CSVs."""
-    source_paths = load_source_paths_from_workbook(workbook)
-    if search_root is not None:
-        source_paths = resolve_source_paths(REQUIRED_SOURCES, search_root, source_paths)
-    else:
-        missing_sources = [name for name in REQUIRED_SOURCES if name not in source_paths]
-        if missing_sources:
-            raise FileNotFoundError(
-                "Could not find all required CSV paths in PathRegistry. Missing:\n- "
-                + "\n- ".join(missing_sources)
-            )
+    source_paths = dict(source_paths or {})
+    missing_sources = [
+        name
+        for name in REQUIRED_SOURCES
+        if name not in source_paths or not source_paths[name].is_file()
+    ]
+    if missing_sources:
+        raise FileNotFoundError(
+            f"Missing or invalid required CSV paths in {PATHS_CONFIG_FILENAME}:\n- "
+            + "\n- ".join(missing_sources)
+        )
 
-    output_path = output_path or load_output_path_from_workbook(workbook)
     if output_path is None:
         workbook_path = Path(getattr(workbook, "fullname", Path.cwd()))
         output_path = workbook_path.parent / "All Transactions.csv"
 
-    excluded_output_path = excluded_output_path or load_excluded_output_path_from_workbook(workbook)
     if excluded_output_path is None:
         excluded_output_path = output_path.with_name(
             f"{output_path.stem} - Excluded{output_path.suffix or '.csv'}"
@@ -1533,7 +1231,7 @@ def build_all_transactions_from_workbook(
 
     print(f"Output path: {output_path}")
     print(f"Excluded output path: {excluded_output_path}")
-    print(f"Resolved {len(source_paths):,} source paths from PathRegistry")
+    print(f"Resolved {len(source_paths):,} source paths")
 
     all_txns = build_all_transactions(source_paths)
     description_lookup = load_description_lookup_from_workbook(workbook)
@@ -1570,174 +1268,61 @@ def build_all_transactions_from_workbook(
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build All Transactions.csv from source exports")
+    parser = argparse.ArgumentParser(
+        description="Build All Transactions.csv using workbook rules and PATHS.json paths"
+    )
     parser.add_argument(
         "--workbook",
         type=str,
         default="",
-        help="Excel workbook whose named tables configure source paths and pipeline rules.",
-    )
-    parser.add_argument(
-        "--search-root",
-        type=str,
-        default="",
-        help="Optional root folder to recursively search for required source CSV files.",
+        help="Excel workbook whose named tables configure pipeline rules (default: Workbook in PATHS.json).",
     )
     parser.add_argument(
         "--output",
         type=str,
         default="",
-        help="Output CSV path (default: PathRegistry in workbook, otherwise ./All Transactions.csv)",
+        help="Override the All Transactions path from PATHS.json.",
     )
     parser.add_argument(
         "--excluded-output",
         type=str,
         default="",
-        help="Path for excluded transactions (default: alongside output as '<output name> - Excluded.csv').",
-    )
-    parser.add_argument(
-        "--description-lookup",
-        type=str,
-        default="",
-        help="Optional CSV path for description substring to category mapping.",
-    )
-    parser.add_argument(
-        "--description-excludes",
-        type=str,
-        default="",
-        help="Optional CSV path for description substrings to exclude.",
-    )
-    parser.add_argument(
-        "--manual-categories",
-        type=str,
-        default="",
-        help="Optional CSV path for manual description category overrides.",
-    )
-    parser.add_argument(
-        "--transaction-excludes",
-        type=str,
-        default="",
-        help="Optional CSV path for transaction exclusion rules.",
-    )
-    parser.add_argument(
-        "--event-replacements",
-        type=str,
-        default="",
-        help="Optional CSV path for one-off replacement transactions to append to output.",
+        help="Override the Excluded Transactions path from PATHS.json.",
     )
     return parser.parse_args(argv)
 
 
 def main(workbook: Optional[Any] = None) -> None:
     args = parse_args()
-    if args.workbook:
-        if workbook is not None:
-            raise ValueError("Pass either a workbook object or --workbook, not both.")
-        if any(
-            (
-                args.description_lookup,
-                args.description_excludes,
-                args.manual_categories,
-                args.transaction_excludes,
-                args.event_replacements,
-            )
-        ):
+    paths_config = load_paths_config()
+    if workbook is not None and args.workbook:
+        raise ValueError("Pass either a workbook object or --workbook, not both.")
+
+    workbook_arg = args.workbook
+    if not workbook_arg and workbook is None and PATHS_CONFIG_WORKBOOK_KEY in paths_config:
+        workbook_arg = str(paths_config[PATHS_CONFIG_WORKBOOK_KEY])
+
+    if workbook is None:
+        if not workbook_arg:
             raise ValueError(
-                "CSV rule options cannot be combined with --workbook; "
-                "use the workbook's rule tables instead."
+                f"No workbook specified. Pass --workbook or configure "
+                f"'{PATHS_CONFIG_WORKBOOK_KEY}' in {PATHS_CONFIG_FILENAME}."
             )
+        workbook = load_workbook_table_data(Path(workbook_arg))
 
-        workbook_data = load_workbook_table_data(Path(args.workbook))
-        search_root = resolve_search_root(args.search_root, workbook_data)
-        if not search_root.exists():
-            raise FileNotFoundError(f"Search root does not exist: {search_root}")
-
-        build_all_transactions_from_workbook(
-            workbook_data,
-            search_root=search_root,
-            output_path=Path(args.output) if args.output else None,
-            excluded_output_path=Path(args.excluded_output) if args.excluded_output else None,
-        )
-        return
-
-    search_root = resolve_search_root(args.search_root, workbook)
-    output_path = resolve_output_path(args.output, workbook)
-    excluded_output_path = resolve_excluded_output_path(args.excluded_output, output_path, workbook)
-
-    if not search_root.exists():
-        raise FileNotFoundError(f"Search root does not exist: {search_root}")
-
-    explicit_source_paths = load_source_paths_from_workbook(workbook) if workbook is not None else None
-    source_paths = resolve_source_paths(REQUIRED_SOURCES, search_root, explicit_source_paths)
-
-    all_txns = build_all_transactions(source_paths)
-
-    desc_lookup_path = (
-        Path(args.description_lookup)
-        if args.description_lookup
-        else find_first_existing_file(search_root, OPTIONAL_RULE_FILES["description_lookup"])
-    )
-    desc_excludes_path = (
-        Path(args.description_excludes)
-        if args.description_excludes
-        else find_first_existing_file(search_root, OPTIONAL_RULE_FILES["description_excludes"])
-    )
-    manual_categories_path = (
-        Path(args.manual_categories)
-        if args.manual_categories
-        else find_first_existing_file(search_root, OPTIONAL_RULE_FILES["manual_categories"])
-    )
-    txn_excludes_path = (
-        Path(args.transaction_excludes)
-        if args.transaction_excludes
-        else find_first_existing_file(search_root, OPTIONAL_RULE_FILES["transaction_excludes"])
-    )
-    event_replacements_path = (
-        Path(args.event_replacements)
-        if args.event_replacements
-        else find_first_existing_file(Path.cwd(), OPTIONAL_RULE_FILES["event_replacements"])
+    output_path = Path(args.output) if args.output else paths_config.get(PATHS_OUTPUT_KEY)
+    excluded_output_path = (
+        Path(args.excluded_output)
+        if args.excluded_output
+        else paths_config.get(PATHS_EXCLUDED_OUTPUT_KEY)
     )
 
-    description_lookup = load_description_lookup(desc_lookup_path)
-    description_excludes = load_description_excludes(desc_excludes_path)
-    manual_categories = load_manual_categories(manual_categories_path)
-    transaction_excludes = load_transaction_excludes(txn_excludes_path)
-    event_replacements = load_event_replacements(event_replacements_path)
-
-    all_txns, excluded_txns = apply_original_rules_with_exclusions(
-        all_txns,
-        description_lookup,
-        description_excludes,
-        manual_categories,
-        transaction_excludes,
+    build_all_transactions_from_workbook(
+        workbook,
+        output_path=output_path,
+        excluded_output_path=excluded_output_path,
+        source_paths=source_paths_from_config(paths_config),
     )
-
-    if not event_replacements.empty:
-        all_txns = pd.concat([all_txns, event_replacements], ignore_index=True)
-
-    rows_before_date_filter = len(all_txns)
-    all_txns, date_excluded = apply_minimum_post_date(all_txns)
-    date_floor_count = rows_before_date_filter - len(all_txns) - len(date_excluded)
-    if not date_excluded.empty:
-        excluded_txns = pd.concat(
-            [excluded_txns, date_excluded],
-            ignore_index=True,
-        )
-
-    all_txns.to_csv(output_path, index=False)
-    excluded_txns.to_csv(excluded_output_path, index=False)
-
-    print(f"Wrote {len(all_txns):,} rows to {output_path.resolve()}")
-    print(
-        f"Wrote {len(excluded_txns):,} excluded rows to {excluded_output_path.resolve()} "
-        f"(date-floor rows not written: {date_floor_count:,})"
-    )
-    print(f"Description lookup rows applied: {len(description_lookup):,}")
-    print(f"Description excludes loaded: {len(description_excludes):,}")
-    print(f"Manual category rules loaded: {len(manual_categories):,}")
-    print(f"Transaction excludes loaded: {len(transaction_excludes):,}")
-    print(f"Event replacements loaded: {len(event_replacements):,}")
-    print(f"Minimum Post Date included: {MIN_POST_DATE.strftime('%Y-%m-%d')}")
 
 
 if __name__ == "__main__":

@@ -20,8 +20,9 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openpyxl import load_workbook
 from openpyxl.utils.cell import range_boundaries
@@ -42,25 +43,6 @@ OUTPUT_COLUMNS = [
 
 INCOME_UPWORK_TYPES = {"Bonus", "Fixed-price", "Hourly", "Expense reimbursement"}
 
-# Source files required for this export.
-REQUIRED_SOURCES: Sequence[str] = [
-    "FirstBank - All Accounts - Transactions.csv",
-    "FirstBank - Gold Visa - Transactions.csv",
-    "PNC - accountActivityExport - Spending.csv",
-    "PNC - accountActivityExport - Savings.csv",
-    "PNC - Cash Rewards Visa - Transactions.csv",
-    "Upwork - Transactions.csv",
-    "Robinhood - Spending Settled - Transactions.csv",
-    "Robinhood - Unified Transfers - Transactions.csv",
-    "Robinhood - Historical Activities - Transactions.csv",
-    "Robinhood - Sweeps - Transactions.csv",
-    "Robinhood - Dividends - Transactions.csv",
-    "Robinhood - Boost Payout - Transactions.csv",
-    "Robinhood - Subscription Fees - Transactions.csv",
-    "Robinhood - Checking - Transactions.csv",
-    "Robinhood - Savings - Transactions.csv",
-]
-
 WORKBOOK_RULE_TABLES: Dict[str, str] = {
     "transaction_excludes": "TransactionExcludes",
     "description_lookup": "DescriptionCategoryLookup",
@@ -75,26 +57,6 @@ PATHS_CONFIG_SECTION = "personal_financial_data_pipeline"
 PATHS_CONFIG_WORKBOOK_KEY = "Workbook"
 PATHS_OUTPUT_KEY = "All Transactions"
 PATHS_EXCLUDED_OUTPUT_KEY = "Excluded Transactions"
-
-# Maps PATHS.json source entry names to REQUIRED_SOURCES keys.
-PATHS_SOURCE_MAP: Dict[str, str] = {
-    "FirstBank All Accounts Transactions": "FirstBank - All Accounts - Transactions.csv",
-    "FirstBank Gold Visa Transactions": "FirstBank - Gold Visa - Transactions.csv",
-    "PNC Spending Transactions": "PNC - accountActivityExport - Spending.csv",
-    "PNC Savings Transactions": "PNC - accountActivityExport - Savings.csv",
-    "PNC Cash Rewards Visa": "PNC - Cash Rewards Visa - Transactions.csv",
-    "Upwork Transactions": "Upwork - Transactions.csv",
-    "Robinhood Spending Settled Transactions": "Robinhood - Spending Settled - Transactions.csv",
-    "Robinhood Unified Transfers Transactions": "Robinhood - Unified Transfers - Transactions.csv",
-    "Robinhood Historical Activities Transactions": "Robinhood - Historical Activities - Transactions.csv",
-    "Robinhood Sweeps Transactions": "Robinhood - Sweeps - Transactions.csv",
-    "Robinhood Dividends Transactions": "Robinhood - Dividends - Transactions.csv",
-    "Robinhood Boost Payout Transactions": "Robinhood - Boost Payout - Transactions.csv",
-    "Robinhood Subscription Fees Transactions": "Robinhood - Subscription Fees - Transactions.csv",
-    "Robinhood Checking Transactions": "Robinhood - Checking - Transactions.csv",
-    "Robinhood Savings Transactions": "Robinhood - Savings - Transactions.csv",
-}
-
 
 @dataclass(frozen=True)
 class WorkbookTableData:
@@ -794,10 +756,8 @@ def load_upwork(path: Path) -> pd.DataFrame:
     return to_standard_frame(out)
 
 
-def load_pnc(path: Path) -> pd.DataFrame:
+def load_pnc(path: Path, account_name: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-
-    account = "PNC Spending" if "Spending" in path.name else "PNC Savings"
 
     df["PostRaw"] = df["Transaction Date"].astype(str)
     # Drop pending rows to keep the output settled-only.
@@ -821,7 +781,7 @@ def load_pnc(path: Path) -> pd.DataFrame:
         {
             "Post Date": df["PostDate"].apply(format_mmddyyyy),
             "Transaction Date": df["PostDate"].apply(format_mmddyyyy),
-            "Account": account,
+            "Account": account_name,
             "Amount": df["AmountNum"].abs(),
             "Description": df["Clean Description"],
             "Type": df["PNC Type"],
@@ -1159,26 +1119,27 @@ def load_rh_account_csv(path: Path, account_name: str) -> pd.DataFrame:
     return to_standard_frame(out)
 
 
+SOURCE_LOADERS: Dict[str, Callable[[Path], pd.DataFrame]] = {
+    "FirstBank All Accounts Transactions": load_firstbank,
+    "FirstBank Gold Visa Transactions": load_firstbank,
+    "PNC Spending Transactions": partial(load_pnc, account_name="PNC Spending"),
+    "PNC Savings Transactions": partial(load_pnc, account_name="PNC Savings"),
+    "PNC Cash Rewards Visa": load_pnc_cash_rewards_visa,
+    "Upwork Transactions": load_upwork,
+    "Robinhood Spending Settled Transactions": load_rh_spending_settled,
+    "Robinhood Unified Transfers Transactions": load_rh_unified_transfers,
+    "Robinhood Historical Activities Transactions": load_rh_historical_activities,
+    "Robinhood Sweeps Transactions": load_rh_sweeps,
+    "Robinhood Dividends Transactions": load_rh_dividends,
+    "Robinhood Boost Payout Transactions": load_rh_boost,
+    "Robinhood Subscription Fees Transactions": load_rh_subscription_fees,
+    "Robinhood Checking Transactions": partial(load_rh_account_csv, account_name="Robinhood Checking"),
+    "Robinhood Savings Transactions": partial(load_rh_account_csv, account_name="Robinhood Savings"),
+}
+
+
 def build_all_transactions(source_paths: Dict[str, Path]) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
-
-    frames.append(load_firstbank(source_paths["FirstBank - All Accounts - Transactions.csv"]))
-    frames.append(load_firstbank(source_paths["FirstBank - Gold Visa - Transactions.csv"]))
-    frames.append(load_pnc(source_paths["PNC - accountActivityExport - Spending.csv"]))
-    frames.append(load_pnc(source_paths["PNC - accountActivityExport - Savings.csv"]))
-    frames.append(load_pnc_cash_rewards_visa(source_paths["PNC - Cash Rewards Visa - Transactions.csv"]))
-    frames.append(load_upwork(source_paths["Upwork - Transactions.csv"]))
-
-    frames.append(load_rh_spending_settled(source_paths["Robinhood - Spending Settled - Transactions.csv"]))
-    frames.append(load_rh_unified_transfers(source_paths["Robinhood - Unified Transfers - Transactions.csv"]))
-    frames.append(load_rh_historical_activities(source_paths["Robinhood - Historical Activities - Transactions.csv"]))
-    frames.append(load_rh_sweeps(source_paths["Robinhood - Sweeps - Transactions.csv"]))
-    frames.append(load_rh_dividends(source_paths["Robinhood - Dividends - Transactions.csv"]))
-    frames.append(load_rh_boost(source_paths["Robinhood - Boost Payout - Transactions.csv"]))
-    frames.append(load_rh_subscription_fees(source_paths["Robinhood - Subscription Fees - Transactions.csv"]))
-    frames.append(load_rh_account_csv(source_paths["Robinhood - Checking - Transactions.csv"], "Robinhood Checking"))
-    frames.append(load_rh_account_csv(source_paths["Robinhood - Savings - Transactions.csv"], "Robinhood Savings"))
-
+    frames = [loader(source_paths[name]) for name, loader in SOURCE_LOADERS.items()]
     all_txns = pd.concat(frames, ignore_index=True)
 
     all_txns["Amount"] = pd.to_numeric(all_txns["Amount"], errors="coerce")
@@ -1191,11 +1152,11 @@ def build_all_transactions(source_paths: Dict[str, Path]) -> pd.DataFrame:
 
 
 def source_paths_from_config(paths_config: Dict[str, Path]) -> Dict[str, Path]:
-    """Map PATHS.json source entries to REQUIRED_SOURCES keys."""
+    """Select the registered source entries from PATHS.json."""
     return {
-        PATHS_SOURCE_MAP[name]: path
+        name: path
         for name, path in paths_config.items()
-        if name in PATHS_SOURCE_MAP
+        if name in SOURCE_LOADERS
     }
 
 
@@ -1209,7 +1170,7 @@ def build_all_transactions_from_workbook(
     source_paths = dict(source_paths or {})
     missing_sources = [
         name
-        for name in REQUIRED_SOURCES
+        for name in SOURCE_LOADERS
         if name not in source_paths or not source_paths[name].is_file()
     ]
     if missing_sources:

@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from openpyxl import Workbook
 from openpyxl.worksheet.table import Table
@@ -124,7 +124,10 @@ class WorkbookCliTests(unittest.TestCase):
             workbook_path = root / "Budget.xlsx"
             self.create_workbook(workbook_path)
             workbook_data = pipeline.load_workbook_table_data(workbook_path)
-            source_paths = {name: root / name for name in pipeline.REQUIRED_SOURCES}
+            source_paths = {
+                name: root / f"{index}.csv"
+                for index, name in enumerate(pipeline.SOURCE_LOADERS)
+            }
             for path in source_paths.values():
                 path.touch()
             transactions = pd.DataFrame(
@@ -176,7 +179,7 @@ class WorkbookCliTests(unittest.TestCase):
                             "Workbook": {"path": "Finance\\Budget.xlsx"},
                             "All Transactions": {"path": "Finance\\Out.csv"},
                             "Excluded Transactions": {"path": "Finance\\Out - Excluded.csv"},
-                            source_name: {"path": "Finance\\Savings.csv"},
+                            source_name: {"path": "Finance\\Savings.csv", "status": "Inactive"},
                         }
                     }
                 ),
@@ -200,9 +203,7 @@ class WorkbookCliTests(unittest.TestCase):
             self.assertEqual(
                 kwargs["source_paths"],
                 {
-                    pipeline.PATHS_SOURCE_MAP[source_name]: onedrive
-                    / "Finance"
-                    / "Savings.csv"
+                    source_name: onedrive / "Finance" / "Savings.csv"
                 },
             )
 
@@ -245,8 +246,8 @@ class WorkbookCliTests(unittest.TestCase):
                 "All Transactions": {"path": "All Transactions.csv"},
                 "Excluded Transactions": {"path": "Excluded.csv"},
             }
-            for label, filename in pipeline.PATHS_SOURCE_MAP.items():
-                source_path = root / "sources" / filename
+            for index, label in enumerate(pipeline.SOURCE_LOADERS):
+                source_path = root / "sources" / f"{index}.csv"
                 source_path.parent.mkdir(parents=True, exist_ok=True)
                 source_path.touch()
                 config[label] = {"path": str(source_path.relative_to(root))}
@@ -291,6 +292,62 @@ class WorkbookCliTests(unittest.TestCase):
             self.assertTrue(excluded.loc["Reject by description", "Exclusion Reason"].startswith("Description exclude:"))
             self.assertTrue(excluded.loc["Reject by transaction", "Exclusion Reason"].startswith("Transaction exclude rule:"))
             self.assertEqual(excluded.loc["Invalid date", "Exclusion Reason"], "Post Date could not be parsed")
+
+    def test_registered_loaders_use_configured_paths(self):
+        frame = pd.DataFrame(
+            [{"Post Date": "1/2/2024", "Amount": 10.0, "Description": "Test"}]
+        )
+        first = Mock(return_value=frame.copy())
+        second = Mock(return_value=frame.copy())
+        loaders = {"First": first, "Second": second}
+        paths = {"First": Path("renamed.csv"), "Second": Path("other.csv")}
+
+        with patch.object(pipeline, "SOURCE_LOADERS", loaders):
+            result = pipeline.build_all_transactions(paths)
+
+        first.assert_called_once_with(paths["First"])
+        second.assert_called_once_with(paths["Second"])
+        self.assertEqual(len(result), 2)
+
+    def test_missing_and_invalid_registered_sources_fail(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            good_path = root / "good.csv"
+            good_path.touch()
+            paths = {"Present": good_path, "Invalid": root / "not-found.csv"}
+            loaders = {"Present": Mock(), "Missing": Mock(), "Invalid": Mock()}
+
+            with patch.object(pipeline, "SOURCE_LOADERS", loaders):
+                with self.assertRaises(FileNotFoundError) as error:
+                    pipeline.build_all_transactions_from_workbook(None, source_paths=paths)
+
+            self.assertIn("Missing", str(error.exception))
+            self.assertIn("Invalid", str(error.exception))
+            for loader in loaders.values():
+                loader.assert_not_called()
+
+    def test_pnc_account_is_selected_by_registry_not_filename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "renamed.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "Transaction Date": "06/30/2026",
+                        "Amount": 10.0,
+                        "Transaction Description": "Before PNC cutoff",
+                    },
+                    {
+                        "Transaction Date": "07/01/2026",
+                        "Amount": 10.0,
+                        "Transaction Description": "Deposit",
+                    }
+                ]
+            ).to_csv(path, index=False)
+            spending = pipeline.SOURCE_LOADERS["PNC Spending Transactions"](path)
+            savings = pipeline.SOURCE_LOADERS["PNC Savings Transactions"](path)
+
+        self.assertEqual(spending["Account"].tolist(), ["PNC Spending"])
+        self.assertEqual(savings["Account"].tolist(), ["PNC Savings"])
 
     def test_cli_requires_workbook_and_rejects_retired_options(self):
         with (

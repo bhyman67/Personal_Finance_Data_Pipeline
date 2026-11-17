@@ -56,6 +56,8 @@ If a `PATHS.json` file exists in the folder named by the `ONEDRIVE` environment 
 
 Command-line options override the corresponding `PATHS.json` values. Paths are not read from the workbook, so the workbook needs no PathRegistry table. Rule tables are always read from the workbook. Entries marked `Inactive` are still read: those sources are no longer updated, but their historical data is still included.
 
+Source labels and their loaders are defined together in `SOURCE_LOADERS`. To add a source, register its loader there and add the matching path entry to `PATHS.json`.
+
 ## Output Schema
 
 The unified output contains:

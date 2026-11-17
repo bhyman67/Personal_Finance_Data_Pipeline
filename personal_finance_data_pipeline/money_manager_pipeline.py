@@ -27,7 +27,6 @@ from openpyxl import load_workbook
 from openpyxl.utils.cell import range_boundaries
 import pandas as pd
 
-MIN_POST_DATE = pd.Timestamp("2022-01-01")
 MIN_PNC_POST_DATE = pd.Timestamp("2026-07-01")
 
 OUTPUT_COLUMNS = [
@@ -718,16 +717,15 @@ def apply_original_rules_with_exclusions(
     return to_standard_frame(df), excluded[OUTPUT_COLUMNS + ["Exclusion Reason"]]
 
 
-def apply_minimum_post_date(
+def sort_and_exclude_invalid_post_dates(
     all_txns: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Apply the minimum post date and report transactions with unparseable dates."""
+    """Sort transactions by post date and report unparseable dates."""
     df = all_txns.copy()
     df["Post Date Sort"] = pd.to_datetime(df["Post Date"], errors="coerce")
-    included_by_date = df["Post Date Sort"] >= MIN_POST_DATE
     excluded = df.loc[df["Post Date Sort"].isna()].copy()
     excluded["Exclusion Reason"] = "Post Date could not be parsed"
-    included = df.loc[included_by_date].copy()
+    included = df.loc[df["Post Date Sort"].notna()].copy()
     included = included.sort_values(by="Post Date Sort", ascending=False)
     included = included.drop(columns=["Post Date Sort"])
     return to_standard_frame(included), excluded[OUTPUT_COLUMNS + ["Exclusion Reason"]]
@@ -1250,9 +1248,7 @@ def build_all_transactions_from_workbook(
     if not event_replacements.empty:
         all_txns = pd.concat([all_txns, event_replacements], ignore_index=True)
 
-    rows_before_date_filter = len(all_txns)
-    all_txns, date_excluded = apply_minimum_post_date(all_txns)
-    date_floor_count = rows_before_date_filter - len(all_txns) - len(date_excluded)
+    all_txns, date_excluded = sort_and_exclude_invalid_post_dates(all_txns)
     if not date_excluded.empty:
         excluded_txns = pd.concat([excluded_txns, date_excluded], ignore_index=True)
 
@@ -1260,10 +1256,7 @@ def build_all_transactions_from_workbook(
     excluded_txns.to_csv(excluded_output_path, index=False)
 
     print(f"Wrote {len(all_txns):,} rows to {output_path.resolve()}")
-    print(
-        f"Wrote {len(excluded_txns):,} excluded rows to {excluded_output_path.resolve()} "
-        f"(date-floor rows not written: {date_floor_count:,})"
-    )
+    print(f"Wrote {len(excluded_txns):,} excluded rows to {excluded_output_path.resolve()}")
     return all_txns
 
 

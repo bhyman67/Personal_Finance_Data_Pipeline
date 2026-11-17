@@ -46,7 +46,9 @@ Run a workbook-configured build from the repository environment:
 
 Alternatively, run `.\.venv\Scripts\python.exe -m personal_finance_data_pipeline.cli --workbook "<workbook path>"`. Save the workbook before running; the command reads the saved file. The workbook path can be omitted when `Workbook` is configured in `PATHS.json`. `--output` and `--excluded-output` override the corresponding paths from `PATHS.json`.
 
-The excluded-transactions file uses the `Excluded Transactions` path in `PATHS.json` when configured. Otherwise, it is written next to the main output as `<output name> - Excluded.csv`. For command-line runs, use `--excluded-output` to choose a different path. It records transactions excluded by the description-exclude rules or transaction-exclude rules, as well as transactions with unparseable post dates that reach the final date filter. Transactions excluded solely because they precede the minimum post date are omitted; rule-excluded transactions are still recorded regardless of their date. The output message reports how many date-floor exclusions were omitted. Rows discarded inside source-specific parsing (for example, invalid dates or amounts) are not included.
+The excluded-transactions file uses the `Excluded Transactions` path in `PATHS.json` when configured. Otherwise, it is written next to the main output as `<output name> - Excluded.csv`. For command-line runs, use `--excluded-output` to choose a different path. It records transactions excluded by the description-exclude rules or transaction-exclude rules, as well as transactions with unparseable post dates that reach the final date check. Rows discarded inside source-specific parsing (for example, invalid dates or amounts) are not included.
+
+There is no global minimum post date. The PNC Spending and Savings loader retains its separate July 1, 2026 cutoff.
 
 ## Shared Path Configuration
 

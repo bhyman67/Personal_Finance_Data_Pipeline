@@ -160,7 +160,7 @@ class WorkbookCliTests(unittest.TestCase):
             self.assertEqual(len(result), 1)
             self.assertEqual(len(pd.read_csv(output_path)), 1)
             self.assertEqual(len(pd.read_csv(excluded_output_path)), 0)
-            self.assertIn("(date-floor rows not written: 0)", stdout.getvalue())
+            self.assertIn(f"Wrote 0 excluded rows to {excluded_output_path.resolve()}", stdout.getvalue())
 
     def test_paths_json_supplies_workbook_and_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -206,7 +206,7 @@ class WorkbookCliTests(unittest.TestCase):
                 },
             )
 
-    def test_date_floor_exclusions_are_not_written(self):
+    def test_older_transactions_are_included_and_invalid_dates_are_excluded(self):
         rows = [
             ("2021-12-31", "Before floor"),
             ("2022-01-01", "At floor"),
@@ -276,12 +276,14 @@ class WorkbookCliTests(unittest.TestCase):
                 pipeline.main()
 
             self.assertIn(
-                f"Wrote 3 excluded rows to {excluded_path.resolve()} (date-floor rows not written: 1)",
+                f"Wrote 3 excluded rows to {excluded_path.resolve()}",
                 stdout.getvalue(),
             )
             included = pd.read_csv(output_path)
             excluded = pd.read_csv(excluded_path).set_index("Description")
-            self.assertEqual(set(included["Description"]), {"At floor", "Recent"})
+            self.assertEqual(
+                list(included["Description"]), ["Recent", "At floor", "Before floor"]
+            )
             self.assertEqual(
                 set(excluded.index),
                 {"Reject by description", "Reject by transaction", "Invalid date"},
